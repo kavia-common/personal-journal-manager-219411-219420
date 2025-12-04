@@ -3,7 +3,7 @@ import os
 import secrets
 from typing import List, Optional, Set, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Path, UploadFile, File, Form, Query
+from fastapi import FastAPI, HTTPException, Path, UploadFile, File, Form, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -12,6 +12,8 @@ from src.api.db import init_db, get_session
 from src.api.models import (
     JournalEntry,
     JournalEntryRead,
+    JournalEntryCreate,
+    JournalEntryUpdate,
 )
 from sqlmodel import select
 
@@ -64,6 +66,35 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 def on_startup() -> None:
     """Initialize database on startup."""
     init_db()
+
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/api/journal-entries/_verify-post",
+    tags=["Journal Entries"],
+    summary="Internal verification: sample POST",
+    description="Creates a sample entry using application/json to verify 201 response path without image. Not for production use.",
+)
+def verify_post_sample():
+    """Create a minimal sample entry to verify JSON create path returns 201."""
+    now = datetime.utcnow()
+    entry = JournalEntry(
+        title="Sample Verification",
+        content="This is a verification entry.",
+        created_at=now,
+        updated_at=now,
+    )
+    with get_session() as session:
+        session.add(entry)
+        session.flush()
+        return JournalEntryRead(
+            id=entry.id,
+            title=entry.title,
+            content=entry.content,
+            image_url=entry.image_url,
+            created_at=entry.created_at,
+            updated_at=entry.updated_at,
+        )
 
 
 # Helpers
@@ -296,22 +327,53 @@ def get_journal_entry(
     status_code=201,
     tags=["Journal Entries"],
     summary="Create a new journal entry",
-    description="Create a journal entry with title, content and optional image upload via multipart/form-data.",
+    description="Create a journal entry. Accepts either application/json with {title, content} when no image is provided, or multipart/form-data with Form fields and optional image when uploading.",
 )
 async def create_journal_entry(
-    title: str = Form(..., description="Title for the journal entry (1..200 chars)"),
-    content: str = Form(..., description="Content/body for the entry (1..10000 chars)"),
+    # JSON path (when Content-Type is application/json)
+    payload: Optional[JournalEntryCreate] = Body(
+        None,
+        description="JSON body with title and content (used when no image is provided)",
+    ),
+    # Multipart path (when Content-Type is multipart/form-data)
+    title: Optional[str] = Form(
+        None, description="Title for the journal entry (1..200 chars)"
+    ),
+    content: Optional[str] = Form(
+        None, description="Content/body for the entry (1..10000 chars)"
+    ),
     image: Optional[UploadFile] = File(None, description="Optional image file"),
 ):
-    """Create a new journal entry. Accepts multipart/form-data with optional image file."""
+    """
+    Create a new journal entry.
+
+    Supports:
+    - application/json: payload with 'title' and 'content' (no image)
+    - multipart/form-data: Form fields 'title', 'content' and optional file field 'image'
+    """
     now = datetime.utcnow()
+
+    # Determine input mode
+    if payload is not None:
+        in_title = payload.title.strip()
+        in_content = payload.content.strip()
+    else:
+        # Multipart requires title/content in Form
+        if title is None or content is None:
+            raise HTTPException(
+                status_code=422,
+                detail="title and content are required",
+            )
+        in_title = title.strip()
+        in_content = content.strip()
+
     image_url: Optional[str] = None
     if image is not None:
         image_url = _save_upload(image)
 
     entry = JournalEntry(
-        title=title.strip(),
-        content=content.strip(),
+        title=in_title,
+        content=in_content,
         image_url=image_url,
         created_at=now,
         updated_at=now,
@@ -335,16 +397,21 @@ async def create_journal_entry(
     response_model=JournalEntryRead,
     tags=["Journal Entries"],
     summary="Update a journal entry",
-    description="Update the title and/or content of an existing journal entry. Accepts multipart/form-data with optional image to replace or remove (pass image_remove=true).",
+    description="Update the title and/or content. Accepts either application/json with partial fields when no file is uploaded, or multipart/form-data with optional image to replace or remove (send image_remove=true). Field names: 'title', 'content', 'image', 'image_remove'.",
 )
 async def update_journal_entry(
     entry_id: int = Path(..., description="The ID of the journal entry to update", ge=1),
+    # JSON path
+    payload: Optional[JournalEntryUpdate] = Body(
+        None, description="JSON body with fields to update when not uploading an image"
+    ),
+    # Multipart path
     title: Optional[str] = Form(None, description="Updated title (1..200 chars)"),
     content: Optional[str] = Form(None, description="Updated content (1..10000 chars)"),
     image: Optional[UploadFile] = File(None, description="Optional image file to replace existing"),
     image_remove: Optional[bool] = Form(False, description="Set true to remove existing image"),
 ):
-    """Update existing journal entry with optional image replacement/removal."""
+    """Update existing journal entry with optional image replacement/removal. Accepts JSON or multipart."""
     with get_session() as session:
         entry = session.get(JournalEntry, entry_id)
         if entry is None:
@@ -352,32 +419,54 @@ async def update_journal_entry(
 
         updated = False
 
-        if title is not None:
-            t = title.strip()
-            if not t:
-                raise HTTPException(status_code=422, detail="Title must not be empty")
-            if t != entry.title:
-                entry.title = t
-                updated = True
+        # Determine mode: prefer JSON when provided and no file in request
+        json_mode = payload is not None and image is None
 
-        if content is not None:
-            c = content.strip()
-            if not c:
-                raise HTTPException(status_code=422, detail="Content must not be empty")
-            if c != entry.content:
-                entry.content = c
-                updated = True
+        if json_mode:
+            # JSON update
+            if payload.title is not None:
+                t = payload.title.strip()
+                if not t:
+                    raise HTTPException(status_code=422, detail="Title must not be empty")
+                if t != entry.title:
+                    entry.title = t
+                    updated = True
+            if payload.content is not None:
+                c = payload.content.strip()
+                if not c:
+                    raise HTTPException(status_code=422, detail="Content must not be empty")
+                if c != entry.content:
+                    entry.content = c
+                    updated = True
+            # No image handling in JSON mode (frontend should use multipart for image ops)
+        else:
+            # Multipart update
+            if title is not None:
+                t = title.strip()
+                if not t:
+                    raise HTTPException(status_code=422, detail="Title must not be empty")
+                if t != entry.title:
+                    entry.title = t
+                    updated = True
 
-        # Handle image update/removal
-        if image_remove:
-            if entry.image_url:
-                entry.image_url = None
-                updated = True
+            if content is not None:
+                c = content.strip()
+                if not c:
+                    raise HTTPException(status_code=422, detail="Content must not be empty")
+                if c != entry.content:
+                    entry.content = c
+                    updated = True
 
-        if image is not None:
-            new_url = _save_upload(image)
-            entry.image_url = new_url
-            updated = True
+            # Handle image update/removal
+            if image_remove:
+                if entry.image_url:
+                    entry.image_url = None
+                    updated = True
+
+            if image is not None:
+                new_url = _save_upload(image)
+                entry.image_url = new_url
+                updated = True
 
         if updated:
             entry.updated_at = datetime.utcnow()
