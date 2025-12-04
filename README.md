@@ -19,3 +19,10 @@ Frontend (Angular) should:
 - Send FormData for create/update when an image is selected
 - Support image replace (send new image) and remove (set image_remove=true)
 - Display image thumbnail when image_url is present
+
+Verification and diagnostics:
+- Use POST /api/journal-entries/_verify-create-json -> expect status_code 201
+- Use POST /api/journal-entries/_verify-create-multipart -> expect status_code 201
+- For updates, use /api/journal-entries/_verify-update-json and /api/journal-entries/_verify-update-multipart -> expect 200
+- If Angular reports 422, call GET /api/journal-entries/_last-validation-error to see the last captured validation context.
+- Inspect current request shape with POST /api/journal-entries/_inspect (sends back parsed JSON/form and Content-Type).

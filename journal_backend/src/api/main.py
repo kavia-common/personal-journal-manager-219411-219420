@@ -48,6 +48,9 @@ app = FastAPI(
     openapi_tags=openapi_tags,
 )
 
+# Simple in-memory diagnostics to capture last validation failure details
+_LAST_VALIDATION_ERROR: Optional[Dict[str, Any]] = None
+
 # CORS - allow Angular frontend based on environment with safe defaults.
 # Prefer ALLOWED_ORIGINS (comma-separated) else fall back to NG_APP_FRONTEND_URL, else permissive "*"
 raw_origins = os.environ.get("ALLOWED_ORIGINS")
@@ -286,6 +289,17 @@ def health_check():
     """Health check endpoint to verify service is running."""
     return {"message": "Healthy"}
 
+# PUBLIC_INTERFACE
+@app.get(
+    "/api/journal-entries/_last-validation-error",
+    tags=["Health"],
+    summary="Diagnostics: last validation error",
+    description="Returns the last captured validation error context for debugging 422 issues.",
+)
+def get_last_validation_error():
+    """Return the last captured validation error context."""
+    return _LAST_VALIDATION_ERROR or {}
+
 
 def _structured_500(message: str, context: Optional[Dict[str, Any]] = None) -> HTTPException:
     """
@@ -486,7 +500,11 @@ def get_journal_entry(
     status_code=201,
     tags=["Journal Entries"],
     summary="Create a new journal entry",
-    description="Create a journal entry. Accepts either application/json with {title, content} when no image is provided, or multipart/form-data with Form fields and optional image when uploading. Field names must be exactly 'title', 'content', 'image', 'image_remove'.",
+    description=(
+        "Create a journal entry. Accepts either application/json with {title, content} when no image is provided, "
+        "or multipart/form-data with Form fields and optional image when uploading. Field names must be exactly "
+        "'title', 'content', 'image', 'image_remove'."
+    ),
 )
 async def create_journal_entry(
     # JSON path (when Content-Type is application/json)
@@ -510,9 +528,18 @@ async def create_journal_entry(
     """
     Create a new journal entry.
 
-    Supports:
-    - application/json: payload with 'title' and optional 'content' (no image)
-    - multipart/form-data: Form fields 'title', 'content' and optional file field 'image'; optional 'image_remove' boolean
+    Accepts:
+    - application/json with fields:
+      • title (required, 1..200 chars)
+      • content (optional, defaults to empty string)
+    - multipart/form-data with fields:
+      • title (required)
+      • content (optional)
+      • image (file, optional)
+      • image_remove (boolean, optional; ignored on create)
+
+    Returns:
+    - 201 Created with JournalEntryRead
     """
     now = datetime.utcnow()
 
@@ -587,6 +614,12 @@ async def create_journal_entry(
                 "image_remove": image_remove,
             }
 
+        global _LAST_VALIDATION_ERROR
+        _LAST_VALIDATION_ERROR = {
+            "endpoint": "POST /api/journal-entries",
+            "context": context_fields,
+            "errors": getattr(http_exc, "detail", None),
+        }
         raise HTTPException(
             status_code=http_exc.status_code,
             detail={
@@ -624,7 +657,16 @@ async def update_journal_entry(
     image: Optional[UploadFile] = File(None, description="Optional image file to replace existing"),
     image_remove: Optional[bool] = Form(False, description="Set true to remove existing image"),
 ):
-    """Update existing journal entry with optional image replacement/removal. Accepts JSON or multipart."""
+    """
+    Update existing journal entry with optional image replacement/removal.
+
+    Accepts:
+    - application/json (when not uploading a file) with partial fields: title, content
+    - multipart/form-data with form fields: title, content, image (file), image_remove (boolean)
+
+    Returns:
+    - 200 OK with JournalEntryRead
+    """
     try:
         with get_session() as session:
             entry = session.get(JournalEntry, entry_id)
@@ -713,6 +755,12 @@ async def update_journal_entry(
                 "image_present": image is not None,
                 "image_remove": image_remove,
             }
+        global _LAST_VALIDATION_ERROR
+        _LAST_VALIDATION_ERROR = {
+            "endpoint": f"PUT /api/journal-entries/{entry_id}",
+            "context": context_fields,
+            "errors": getattr(http_exc, "detail", None),
+        }
         raise HTTPException(
             status_code=http_exc.status_code,
             detail={
