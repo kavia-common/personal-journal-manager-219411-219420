@@ -16,7 +16,13 @@ engine = create_engine(DATABASE_URL, echo=False, connect_args={"check_same_threa
 
 
 def init_db() -> None:
-    """Create database tables if missing (and ensure new columns like image_url are present)."""
+    """
+    Create database tables if missing.
+
+    Note: SQLModel/SQLite create_all will not auto-migrate existing tables to add new columns.
+    If running against an older DB missing created_at/updated_at/image_url, consider migrating
+    or recreating the DB. Fresh environments will have correct schema.
+    """
     SQLModel.metadata.create_all(engine)
 
 

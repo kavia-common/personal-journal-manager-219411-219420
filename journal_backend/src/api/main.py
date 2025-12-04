@@ -102,7 +102,15 @@ def _structured_500(message: str, context: Optional[Dict[str, Any]] = None) -> H
     """
     detail: Dict[str, Any] = {"error": message}
     if context:
-        detail["context"] = context
+        # Ensure context is JSON serializable
+        safe_ctx: Dict[str, Any] = {}
+        for k, v in context.items():
+            try:
+                str(v)  # attempt simple coercion for safety
+                safe_ctx[k] = v
+            except Exception:
+                safe_ctx[k] = repr(v)
+        detail["context"] = safe_ctx
     return HTTPException(status_code=500, detail=detail)
 
 
@@ -135,22 +143,35 @@ def list_journal_entries(
         with get_session() as session:
             stmt = select(JournalEntry)
 
-            # Apply date filtering on created_at via inclusive bounds (guard against null created_at)
+            # Build inclusive datetime bounds once
+            start_dt: Optional[datetime] = None
+            end_dt: Optional[datetime] = None
             if start_date:
-                stmt = stmt.where(JournalEntry.created_at != None)  # noqa: E711
-                stmt = stmt.where(JournalEntry.created_at >= datetime.combine(start_date, datetime.min.time()))
+                start_dt = datetime.combine(start_date, datetime.min.time())
             if end_date:
-                stmt = stmt.where(JournalEntry.created_at != None)  # noqa: E711
-                stmt = stmt.where(JournalEntry.created_at <= datetime.combine(end_date, datetime.max.time()))
+                # Use max time for inclusive end of day
+                end_dt = datetime.combine(end_date, datetime.max.time())
 
+            # Guard against null created_at before applying range bounds
+            if start_dt is not None:
+                stmt = stmt.where(JournalEntry.created_at != None)  # noqa: E711
+                stmt = stmt.where(JournalEntry.created_at >= start_dt)
+            if end_dt is not None:
+                stmt = stmt.where(JournalEntry.created_at != None)  # noqa: E711
+                stmt = stmt.where(JournalEntry.created_at <= end_dt)
+
+            # Always order by latest updated first
             stmt = stmt.order_by(JournalEntry.updated_at.desc())
-            entries = session.exec(stmt).all() or []
+
+            entries = session.exec(stmt).all()
+            if not entries:
+                return []
 
             # Ensure robustness if any row has nulls unexpectedly
             safe_entries: List[JournalEntryRead] = []
             for e in entries:
                 # Skip rows missing essential timestamps to prevent .date() or serialization errors
-                if not e.created_at or not e.updated_at:
+                if not getattr(e, "created_at", None) or not getattr(e, "updated_at", None):
                     continue
                 safe_entries.append(
                     JournalEntryRead(
@@ -162,12 +183,20 @@ def list_journal_entries(
                         updated_at=e.updated_at,
                     )
                 )
+            # If all were filtered out due to nulls, still return []
             return safe_entries
     except HTTPException:
         raise
     except Exception as exc:
         # Return a structured 500 with error detail to aid debugging in preview
-        raise _structured_500("Failed to list journal entries", {"exception": str(exc)})
+        raise _structured_500(
+            "Failed to list journal entries",
+            {
+                "exception": str(exc),
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat() if end_date else None,
+            },
+        )
 
 
 class DatesWithEntriesResponse(JSONResponse):
@@ -194,23 +223,34 @@ def get_dates_with_entries(
 
     try:
         with get_session() as session:
+            start_dt = datetime.combine(start_date, datetime.min.time())
+            end_dt = datetime.combine(end_date, datetime.max.time())
+
             stmt = select(JournalEntry).where(
                 JournalEntry.created_at != None,  # noqa: E711
-                JournalEntry.created_at >= datetime.combine(start_date, datetime.min.time()),
-                JournalEntry.created_at <= datetime.combine(end_date, datetime.max.time()),
+                JournalEntry.created_at >= start_dt,
+                JournalEntry.created_at <= end_dt,
             )
-            entries = session.exec(stmt).all() or []
+            entries = session.exec(stmt).all()
 
             days: Set[str] = set()
-            for e in entries:
-                if e.created_at:
-                    days.add(e.created_at.date().isoformat())
+            if entries:
+                for e in entries:
+                    if getattr(e, "created_at", None):
+                        days.add(e.created_at.date().isoformat())
         # Always return 200 with dates array (possibly empty)
         return {"dates": sorted(list(days))}
     except HTTPException:
         raise
     except Exception as exc:
-        raise _structured_500("Failed to fetch dates with entries", {"exception": str(exc)})
+        raise _structured_500(
+            "Failed to fetch dates with entries",
+            {
+                "exception": str(exc),
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+            },
+        )
 
 
 # PUBLIC_INTERFACE
