@@ -97,6 +97,46 @@ def verify_post_sample():
         )
 
 
+# PUBLIC_INTERFACE
+@app.post(
+    "/api/journal-entries/_verify-create-json",
+    tags=["Journal Entries"],
+    summary="Internal: verify JSON create path",
+    description="Sends an application/json request to POST /api/journal-entries and returns the result.",
+)
+async def verify_create_json():
+    """Internal helper to verify application/json create path."""
+    try:
+        from fastapi.testclient import TestClient  # local usage without network
+        client = TestClient(app)
+        resp = client.post("/api/journal-entries", json={"title": "JSON Title", "content": ""})
+        return {"status_code": resp.status_code, "json": resp.json()}
+    except Exception as exc:
+        raise _structured_500("Verification failed (JSON create)", {"exception": str(exc)})
+
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/api/journal-entries/_verify-create-multipart",
+    tags=["Journal Entries"],
+    summary="Internal: verify multipart create path",
+    description="Sends a multipart/form-data request to POST /api/journal-entries (no file) and returns the result.",
+)
+async def verify_create_multipart():
+    """Internal helper to verify multipart/form-data create path."""
+    try:
+        from fastapi.testclient import TestClient
+        client = TestClient(app)
+        resp = client.post(
+            "/api/journal-entries",
+            files={},  # no image
+            data={"title": "MP Title", "content": ""},
+        )
+        return {"status_code": resp.status_code, "json": resp.json()}
+    except Exception as exc:
+        raise _structured_500("Verification failed (multipart create)", {"exception": str(exc)})
+
+
 # Helpers
 def _save_upload(file: UploadFile) -> str:
     """
@@ -327,47 +367,60 @@ def get_journal_entry(
     status_code=201,
     tags=["Journal Entries"],
     summary="Create a new journal entry",
-    description="Create a journal entry. Accepts either application/json with {title, content} when no image is provided, or multipart/form-data with Form fields and optional image when uploading.",
+    description="Create a journal entry. Accepts either application/json with {title, content, image_remove?} when no image is provided, or multipart/form-data with Form fields and optional image when uploading. Field names must be exactly 'title', 'content', 'image', 'image_remove'.",
 )
 async def create_journal_entry(
     # JSON path (when Content-Type is application/json)
     payload: Optional[JournalEntryCreate] = Body(
         None,
         description="JSON body with title and content (used when no image is provided)",
+        examples={
+            "json": {
+                "summary": "JSON create without image",
+                "description": "Create a journal entry using JSON payload",
+                "value": {"title": "My day", "content": "Went hiking today."},
+            }
+        },
     ),
     # Multipart path (when Content-Type is multipart/form-data)
     title: Optional[str] = Form(
         None, description="Title for the journal entry (1..200 chars)"
     ),
     content: Optional[str] = Form(
-        None, description="Content/body for the entry (1..10000 chars)"
+        None, description="Content/body for the entry (0..10000 chars); may be empty"
     ),
-    image: Optional[UploadFile] = File(None, description="Optional image file"),
+    image: Optional[UploadFile] = File(None, description="Optional image file",),
+    image_remove: Optional[bool] = Form(
+        False,
+        description="Set true to explicitly remove an already-attached image (not typical on create).",
+    ),
 ):
     """
     Create a new journal entry.
 
     Supports:
-    - application/json: payload with 'title' and 'content' (no image)
-    - multipart/form-data: Form fields 'title', 'content' and optional file field 'image'
+    - application/json: payload with 'title' and optional 'content' (no image)
+    - multipart/form-data: Form fields 'title', 'content' and optional file field 'image'; optional 'image_remove' boolean
     """
     now = datetime.utcnow()
 
-    # Determine input mode
+    # Determine input mode: prefer JSON when provided and no file/image fields are present
+    # In FastAPI, both sets of params are visible; decision is based on payload existence.
     if payload is not None:
         in_title = payload.title.strip()
-        in_content = payload.content.strip()
+        in_content = (payload.content or "").strip()
     else:
-        # Multipart requires title/content in Form
-        if title is None or content is None:
+        # Multipart requires title at minimum; content can be empty per UI behavior.
+        if title is None:
             raise HTTPException(
                 status_code=422,
-                detail="title and content are required",
+                detail={"error": "Validation error", "detail": [{"loc": ["form", "title"], "msg": "Field required", "type": "value_error.missing"}]},
             )
         in_title = title.strip()
-        in_content = content.strip()
+        in_content = (content or "").strip()
 
     image_url: Optional[str] = None
+    # image_remove on create is ignored unless provided true with existing image (no existing on create)
     if image is not None:
         image_url = _save_upload(image)
 
@@ -403,11 +456,18 @@ async def update_journal_entry(
     entry_id: int = Path(..., description="The ID of the journal entry to update", ge=1),
     # JSON path
     payload: Optional[JournalEntryUpdate] = Body(
-        None, description="JSON body with fields to update when not uploading an image"
+        None,
+        description="JSON body with fields to update when not uploading an image",
+        examples={
+            "json-partial": {
+                "summary": "Partial JSON update",
+                "value": {"title": "Updated title"},
+            }
+        },
     ),
     # Multipart path
     title: Optional[str] = Form(None, description="Updated title (1..200 chars)"),
-    content: Optional[str] = Form(None, description="Updated content (1..10000 chars)"),
+    content: Optional[str] = Form(None, description="Updated content (0..10000 chars)"),
     image: Optional[UploadFile] = File(None, description="Optional image file to replace existing"),
     image_remove: Optional[bool] = Form(False, description="Set true to remove existing image"),
 ):
@@ -427,14 +487,16 @@ async def update_journal_entry(
             if payload.title is not None:
                 t = payload.title.strip()
                 if not t:
-                    raise HTTPException(status_code=422, detail="Title must not be empty")
+                    raise HTTPException(
+                        status_code=422,
+                        detail={"error": "Validation error", "detail": [{"loc": ["body", "title"], "msg": "Title must not be empty", "type": "value_error"}]},
+                    )
                 if t != entry.title:
                     entry.title = t
                     updated = True
             if payload.content is not None:
                 c = payload.content.strip()
-                if not c:
-                    raise HTTPException(status_code=422, detail="Content must not be empty")
+                # Allow empty content to clear body
                 if c != entry.content:
                     entry.content = c
                     updated = True
@@ -444,15 +506,17 @@ async def update_journal_entry(
             if title is not None:
                 t = title.strip()
                 if not t:
-                    raise HTTPException(status_code=422, detail="Title must not be empty")
+                    raise HTTPException(
+                        status_code=422,
+                        detail={"error": "Validation error", "detail": [{"loc": ["form", "title"], "msg": "Title must not be empty", "type": "value_error"}]},
+                    )
                 if t != entry.title:
                     entry.title = t
                     updated = True
 
             if content is not None:
                 c = content.strip()
-                if not c:
-                    raise HTTPException(status_code=422, detail="Content must not be empty")
+                # Allow empty content to clear body
                 if c != entry.content:
                     entry.content = c
                     updated = True

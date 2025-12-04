@@ -10,7 +10,8 @@ class JournalEntry(SQLModel, table=True):
     """SQLModel table for journal entries with optional image URL."""
     id: Optional[int] = SQLField(default=None, primary_key=True, index=True)
     title: str = SQLField(index=True, min_length=1, max_length=200)
-    content: str = SQLField(min_length=1, max_length=10_000)
+    # Allow empty content at DB layer to match UI allowance (empty note body)
+    content: str = SQLField(min_length=0, max_length=10_000)
     image_url: Optional[str] = SQLField(default=None, nullable=True)  # path/URL to the uploaded image
     created_at: datetime = SQLField(default_factory=datetime.utcnow, nullable=False)
     updated_at: datetime = SQLField(default_factory=datetime.utcnow, nullable=False)
@@ -18,9 +19,13 @@ class JournalEntry(SQLModel, table=True):
 
 # PUBLIC_INTERFACE
 class JournalEntryCreate(BaseModel):
-    """Payload model to create a new journal entry."""
+    """Payload model to create a new journal entry.
+
+    Notes:
+    - content is optional and may be empty string to match UI behavior.
+    """
     title: str = Field(..., min_length=1, max_length=200, description="Title for the journal entry (1..200 chars)")
-    content: str = Field(..., min_length=1, max_length=10_000, description="Content/body for the entry (1..10000 chars)")
+    content: Optional[str] = Field("", min_length=0, max_length=10_000, description="Content/body for the entry (0..10000 chars). Defaults to empty.")
 
     @field_validator("title")
     @classmethod
@@ -32,18 +37,24 @@ class JournalEntryCreate(BaseModel):
 
     @field_validator("content")
     @classmethod
-    def strip_content(cls, v: str) -> str:
-        s = v.strip()
-        if not s:
-            raise ValueError("Content must not be empty")
-        return s
+    def normalize_content(cls, v: Optional[str]) -> str:
+        # If None, normalize to empty string
+        if v is None:
+            return ""
+        # Preserve user intention; strip only trailing newlines/spaces at ends
+        return v.strip()
 
 
 # PUBLIC_INTERFACE
 class JournalEntryUpdate(BaseModel):
-    """Payload model to update an existing journal entry."""
+    """Payload model to update an existing journal entry.
+
+    Notes:
+    - title/content fields are optional; when provided, title must be non-empty after trim.
+    - content may be empty string to clear the body.
+    """
     title: Optional[str] = Field(None, min_length=1, max_length=200, description="Updated title (1..200 chars)")
-    content: Optional[str] = Field(None, min_length=1, max_length=10_000, description="Updated content (1..10000 chars)")
+    content: Optional[str] = Field(None, min_length=0, max_length=10_000, description="Updated content (0..10000 chars)")
 
     @field_validator("title")
     @classmethod
@@ -57,13 +68,10 @@ class JournalEntryUpdate(BaseModel):
 
     @field_validator("content")
     @classmethod
-    def strip_content(cls, v: Optional[str]) -> Optional[str]:
+    def normalize_content(cls, v: Optional[str]) -> Optional[str]:
         if v is None:
             return v
-        s = v.strip()
-        if not s:
-            raise ValueError("Content must not be empty")
-        return s
+        return v.strip()
 
 
 # PUBLIC_INTERFACE
