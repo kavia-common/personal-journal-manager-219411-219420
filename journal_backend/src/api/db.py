@@ -16,7 +16,7 @@ engine = create_engine(DATABASE_URL, echo=False, connect_args={"check_same_threa
 
 
 def init_db() -> None:
-    """Create database tables if missing."""
+    """Create database tables if missing (and ensure new columns like image_url are present)."""
     SQLModel.metadata.create_all(engine)
 
 

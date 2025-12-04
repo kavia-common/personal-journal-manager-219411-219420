@@ -7,10 +7,11 @@ from sqlmodel import SQLModel, Field as SQLField
 
 # Database Models
 class JournalEntry(SQLModel, table=True):
-    """SQLModel table for journal entries."""
+    """SQLModel table for journal entries with optional image URL."""
     id: Optional[int] = SQLField(default=None, primary_key=True, index=True)
     title: str = SQLField(index=True, min_length=1, max_length=200)
     content: str = SQLField(min_length=1, max_length=10_000)
+    image_url: Optional[str] = SQLField(default=None, nullable=True)  # path/URL to the uploaded image
     created_at: datetime = SQLField(default_factory=datetime.utcnow, nullable=False)
     updated_at: datetime = SQLField(default_factory=datetime.utcnow, nullable=False)
 
@@ -71,5 +72,6 @@ class JournalEntryRead(BaseModel):
     id: int = Field(..., description="Entry identifier")
     title: str = Field(..., description="Entry title")
     content: str = Field(..., description="Entry content")
+    image_url: Optional[str] = Field(None, description="Public URL path to the attached image")
     created_at: datetime = Field(..., description="Creation timestamp (UTC)")
     updated_at: datetime = Field(..., description="Last update timestamp (UTC)")
