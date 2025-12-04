@@ -5,7 +5,7 @@ from typing import List, Optional, Set, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Path, UploadFile, File, Form, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from src.api.db import init_db, get_session
@@ -158,6 +158,27 @@ def _save_upload(file: UploadFile) -> str:
     with open(dest_path, "wb") as out:
         out.write(file.file.read())
     return f"/static/uploads/{filename}"
+
+
+def _delete_existing_file(image_url: Optional[str]) -> None:
+    """
+    If image_url points under /static/uploads, delete the corresponding file from disk.
+    Silently ignore errors to avoid blocking request on filesystem issues.
+    """
+    if not image_url:
+        return
+    # image_url expected like "/static/uploads/<name>"
+    try:
+        prefix = "/static/uploads/"
+        if image_url.startswith(prefix):
+            filename = image_url[len(prefix):]
+            if filename:
+                path = os.path.join(UPLOADS_DIR, filename)
+                if os.path.isfile(path):
+                    os.remove(path)
+    except Exception:
+        # Do not raise; best effort cleanup
+        pass
 
 
 # PUBLIC_INTERFACE
@@ -367,7 +388,7 @@ def get_journal_entry(
     status_code=201,
     tags=["Journal Entries"],
     summary="Create a new journal entry",
-    description="Create a journal entry. Accepts either application/json with {title, content, image_remove?} when no image is provided, or multipart/form-data with Form fields and optional image when uploading. Field names must be exactly 'title', 'content', 'image', 'image_remove'.",
+    description="Create a journal entry. Accepts either application/json with {title, content} when no image is provided, or multipart/form-data with Form fields and optional image when uploading. Field names must be exactly 'title', 'content', 'image', 'image_remove'.",
 )
 async def create_journal_entry(
     # JSON path (when Content-Type is application/json)
@@ -524,10 +545,15 @@ async def update_journal_entry(
             # Handle image update/removal
             if image_remove:
                 if entry.image_url:
+                    # remove file from disk
+                    _delete_existing_file(entry.image_url)
                     entry.image_url = None
                     updated = True
 
             if image is not None:
+                # replace existing file if any
+                if entry.image_url:
+                    _delete_existing_file(entry.image_url)
                 new_url = _save_upload(image)
                 entry.image_url = new_url
                 updated = True
@@ -563,6 +589,10 @@ def delete_journal_entry(
         entry = session.get(JournalEntry, entry_id)
         if entry is None:
             raise HTTPException(status_code=404, detail="Journal entry not found")
+        # attempt to delete any associated file
+        if entry.image_url:
+            _delete_existing_file(entry.image_url)
         session.delete(entry)
         session.flush()
-    return JSONResponse(status_code=204, content=None)
+    # Return empty 204 response
+    return Response(status_code=204)
