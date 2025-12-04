@@ -1,7 +1,7 @@
 from datetime import datetime, date
 import os
 import secrets
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Path, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -96,6 +96,16 @@ def health_check():
     return {"message": "Healthy"}
 
 
+def _structured_500(message: str, context: Optional[Dict[str, Any]] = None) -> HTTPException:
+    """
+    Build a structured HTTPException for 500 errors with optional context for debugging.
+    """
+    detail: Dict[str, Any] = {"error": message}
+    if context:
+        detail["context"] = context
+    return HTTPException(status_code=500, detail=detail)
+
+
 # PUBLIC_INTERFACE
 @app.get(
     "/api/journal-entries",
@@ -125,30 +135,39 @@ def list_journal_entries(
         with get_session() as session:
             stmt = select(JournalEntry)
 
-            # Apply date filtering on created_at via inclusive bounds
+            # Apply date filtering on created_at via inclusive bounds (guard against null created_at)
             if start_date:
+                stmt = stmt.where(JournalEntry.created_at != None)  # noqa: E711
                 stmt = stmt.where(JournalEntry.created_at >= datetime.combine(start_date, datetime.min.time()))
             if end_date:
+                stmt = stmt.where(JournalEntry.created_at != None)  # noqa: E711
                 stmt = stmt.where(JournalEntry.created_at <= datetime.combine(end_date, datetime.max.time()))
 
             stmt = stmt.order_by(JournalEntry.updated_at.desc())
             entries = session.exec(stmt).all() or []
-            return [
-                JournalEntryRead(
-                    id=e.id,
-                    title=e.title,
-                    content=e.content,
-                    image_url=e.image_url,
-                    created_at=e.created_at,
-                    updated_at=e.updated_at,
+
+            # Ensure robustness if any row has nulls unexpectedly
+            safe_entries: List[JournalEntryRead] = []
+            for e in entries:
+                # Skip rows missing essential timestamps to prevent .date() or serialization errors
+                if not e.created_at or not e.updated_at:
+                    continue
+                safe_entries.append(
+                    JournalEntryRead(
+                        id=e.id,
+                        title=e.title,
+                        content=e.content,
+                        image_url=e.image_url,
+                        created_at=e.created_at,
+                        updated_at=e.updated_at,
+                    )
                 )
-                for e in entries
-            ]
+            return safe_entries
     except HTTPException:
         raise
     except Exception as exc:
         # Return a structured 500 with error detail to aid debugging in preview
-        raise HTTPException(status_code=500, detail=f"Failed to list journal entries: {exc}")
+        raise _structured_500("Failed to list journal entries", {"exception": str(exc)})
 
 
 class DatesWithEntriesResponse(JSONResponse):
@@ -176,6 +195,7 @@ def get_dates_with_entries(
     try:
         with get_session() as session:
             stmt = select(JournalEntry).where(
+                JournalEntry.created_at != None,  # noqa: E711
                 JournalEntry.created_at >= datetime.combine(start_date, datetime.min.time()),
                 JournalEntry.created_at <= datetime.combine(end_date, datetime.max.time()),
             )
@@ -183,12 +203,14 @@ def get_dates_with_entries(
 
             days: Set[str] = set()
             for e in entries:
-                days.add(e.created_at.date().isoformat())
+                if e.created_at:
+                    days.add(e.created_at.date().isoformat())
+        # Always return 200 with dates array (possibly empty)
         return {"dates": sorted(list(days))}
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch dates with entries: {exc}")
+        raise _structured_500("Failed to fetch dates with entries", {"exception": str(exc)})
 
 
 # PUBLIC_INTERFACE
