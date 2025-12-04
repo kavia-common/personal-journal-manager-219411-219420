@@ -218,11 +218,19 @@ async def inspect_request(
     """Return basic info about the request for debugging client payload issues."""
     try:
         ct = request.headers.get("content-type", "")
+        form_data = {
+            "title": title,
+            "content": content,
+            "image_remove": image_remove,
+            "has_title": title is not None,
+            "has_content": content is not None,
+            "has_image_remove": image_remove is not None,
+        }
         return {
             "content_type": ct,
             "has_json_payload": payload is not None,
             "json_payload": payload.model_dump() if payload is not None else None,
-            "form": {"title": title, "content": content, "image_remove": image_remove},
+            "form": form_data,
         }
     except Exception as exc:
         raise _structured_500("Inspection failed", {"exception": str(exc)})
@@ -511,26 +519,32 @@ async def create_journal_entry(
     try:
         # Prefer JSON mode when payload provided (Angular sends application/json when no image)
         if payload is not None:
-            # JournalEntryCreate already validates/strips title/content; enforce again defensively
+            # JournalEntryCreate model trims and validates title/content; still guard defensively
             in_title = (payload.title or "").strip()
+            in_content = (payload.content or "")
+            # allow empty content (UI often sends empty string)
+            in_content = in_content if in_content is not None else ""
+            in_content = in_content.strip()
             if not in_title:
-                # Mirror FastAPI validation shape for body field
                 raise HTTPException(
                     status_code=422,
-                    detail=[{"loc": ["body", "title"], "msg": "Field required", "type": "value_error.missing"}],
+                    detail=[
+                        {"loc": ["body", "title"], "msg": "Title is required", "type": "value_error"}
+                    ],
                 )
-            # content is optional and defaults to empty string
-            in_content = (payload.content or "").strip()
         else:
             # Multipart mode (Angular sends multipart/form-data when image selected)
-            if title is None or not str(title).strip():
+            raw_title = "" if title is None else str(title)
+            in_title = raw_title.strip()
+            raw_content = "" if content is None else str(content)
+            in_content = raw_content.strip()
+            if not in_title:
                 raise HTTPException(
                     status_code=422,
-                    detail=[{"loc": ["form", "title"], "msg": "Field required", "type": "value_error.missing"}],
+                    detail=[
+                        {"loc": ["form", "title"], "msg": "Title is required", "type": "value_error"}
+                    ],
                 )
-            in_title = str(title).strip()
-            # content optional; default to empty string when omitted
-            in_content = (content or "").strip()
 
         image_url: Optional[str] = None
         # image_remove on create is typically ignored; if a file present, save it
@@ -556,21 +570,29 @@ async def create_journal_entry(
                 updated_at=entry.updated_at,
             )
     except HTTPException as http_exc:
-        # Add explicit context for validation mismatches to ease debugging in logs
-        ct = "unknown"
-        try:
-            # Avoid importing Request here; keep context minimal
-            ct = "json" if payload is not None else "multipart"
-        except Exception:
-            pass
+        # Add explicit context for validation mismatches to ease debugging in logs and UI
+        mode = "json" if payload is not None else "multipart"
+        # Prepare a snapshot of inputs for troubleshooting (safe/limited)
+        context_fields: Dict[str, Any] = {"mode": mode}
+        if mode == "json":
+            try:
+                context_fields["payload"] = payload.model_dump() if payload is not None else None
+            except Exception:
+                context_fields["payload"] = None
+        else:
+            context_fields["form"] = {
+                "title_present": title is not None,
+                "content_present": content is not None,
+                "image_present": image is not None,
+                "image_remove": image_remove,
+            }
+
         raise HTTPException(
             status_code=http_exc.status_code,
             detail={
                 "error": "Validation failed creating journal entry",
-                "context": {
-                    "mode": ct,
-                    "detail": getattr(http_exc, "detail", None),
-                },
+                "context": context_fields,
+                "errors": getattr(http_exc, "detail", None),
             },
         )
     except Exception as exc:
@@ -638,7 +660,7 @@ async def update_journal_entry(
                     if not t:
                         raise HTTPException(
                             status_code=422,
-                            detail=[{"loc": ["form", "title"], "msg": "Title must not be empty", "type": "value_error.missing"}],
+                            detail=[{"loc": ["form", "title"], "msg": "Title must not be empty", "type": "value_error"}],
                         )
                     if t != entry.title:
                         entry.title = t
@@ -675,8 +697,30 @@ async def update_journal_entry(
                 created_at=entry.created_at,
                 updated_at=entry.updated_at,
             )
-    except HTTPException:
-        raise
+    except HTTPException as http_exc:
+        # Return structured, consistent validation details for the UI to display
+        mode = "json" if (payload is not None and image is None) else "multipart"
+        context_fields: Dict[str, Any] = {"mode": mode, "entry_id": entry_id}
+        if mode == "json":
+            try:
+                context_fields["payload"] = payload.model_dump() if payload is not None else None
+            except Exception:
+                context_fields["payload"] = None
+        else:
+            context_fields["form"] = {
+                "title_present": title is not None,
+                "content_present": content is not None,
+                "image_present": image is not None,
+                "image_remove": image_remove,
+            }
+        raise HTTPException(
+            status_code=http_exc.status_code,
+            detail={
+                "error": "Validation failed updating journal entry",
+                "context": context_fields,
+                "errors": getattr(http_exc, "detail", None),
+            },
+        )
     except Exception as exc:
         raise _structured_500("Failed to update journal entry", {"exception": str(exc), "entry_id": entry_id})
 
