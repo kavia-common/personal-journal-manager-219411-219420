@@ -1,9 +1,9 @@
-from datetime import datetime
+from datetime import datetime, date
 import os
 import secrets
-from typing import List, Optional
+from typing import List, Optional, Set
 
-from fastapi import FastAPI, HTTPException, Path, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Path, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -29,14 +29,17 @@ openapi_tags = [
 app = FastAPI(
     title="Personal Journal API",
     description="REST API for managing personal journal entries. Provides CRUD operations and OpenAPI docs.",
-    version="0.1.0",
+    version="0.1.1",
     openapi_tags=openapi_tags,
 )
 
-# CORS - keep Angular frontend allowed; allow localhost:3000 as specified
+# CORS - allow Angular frontend based on environment with safe defaults
+frontend_origin = os.environ.get("NG_APP_FRONTEND_URL", "http://localhost:3000")
+allow_origins = [frontend_origin] if isinstance(frontend_origin, str) else ["http://localhost:3000"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -94,12 +97,37 @@ def health_check():
     response_model=List[JournalEntryRead],
     tags=["Journal Entries"],
     summary="List journal entries",
-    description="Returns a list of all journal entries ordered by most recently updated.",
+    description="Returns a list of journal entries ordered by most recently updated. Supports optional date-range filtering using start_date and end_date (YYYY-MM-DD).",
 )
-def list_journal_entries():
-    """List all journal entries."""
+def list_journal_entries(
+    start_date: Optional[date] = Query(None, description="Start date (YYYY-MM-DD), inclusive"),
+    end_date: Optional[date] = Query(None, description="End date (YYYY-MM-DD), inclusive"),
+):
+    """
+    List journal entries with optional date-range filtering.
+
+    Parameters:
+    - start_date: optional start date YYYY-MM-DD (inclusive)
+    - end_date: optional end date YYYY-MM-DD (inclusive)
+
+    Returns:
+    - List of JournalEntryRead
+    """
+    if start_date and end_date and end_date < start_date:
+        raise HTTPException(status_code=400, detail="end_date must be on or after start_date")
+
     with get_session() as session:
-        stmt = select(JournalEntry).order_by(JournalEntry.updated_at.desc())
+        stmt = select(JournalEntry)
+
+        # Apply date filtering on created_at.date() via bounds on datetime
+        if start_date:
+            # start of the day: >= start_date 00:00:00
+            stmt = stmt.where(JournalEntry.created_at >= datetime.combine(start_date, datetime.min.time()))
+        if end_date:
+            # inclusive end-of-day: <= end_date 23:59:59.999999
+            stmt = stmt.where(JournalEntry.created_at <= datetime.combine(end_date, datetime.max.time()))
+
+        stmt = stmt.order_by(JournalEntry.updated_at.desc())
         entries = session.exec(stmt).all()
         return [
             JournalEntryRead(
@@ -112,6 +140,44 @@ def list_journal_entries():
             )
             for e in entries
         ]
+
+
+class DatesWithEntriesResponse(JSONResponse):
+    pass
+
+
+# PUBLIC_INTERFACE
+@app.get(
+    "/api/journal-entries/dates",
+    tags=["Journal Entries"],
+    summary="Get dates with entries",
+    description="Returns the list of calendar dates (YYYY-MM-DD) that have entries within the provided inclusive date range.",
+)
+def get_dates_with_entries(
+    start_date: date = Query(..., description="Start date (YYYY-MM-DD), inclusive"),
+    end_date: date = Query(..., description="End date (YYYY-MM-DD), inclusive"),
+):
+    """
+    Returns only the distinct dates that have at least one entry within the given inclusive range.
+    Useful for calendar highlighting in the Angular app.
+    """
+    if end_date < start_date:
+        raise HTTPException(status_code=400, detail="end_date must be on or after start_date")
+
+    with get_session() as session:
+        stmt = select(JournalEntry).where(
+            JournalEntry.created_at >= datetime.combine(start_date, datetime.min.time()),
+            JournalEntry.created_at <= datetime.combine(end_date, datetime.max.time()),
+        )
+        entries = session.exec(stmt).all()
+
+        # Collect unique dates (as ISO YYYY-MM-DD strings) to be JSON-friendly
+        days: Set[str] = set()
+        for e in entries:
+            days.add(e.created_at.date().isoformat())
+
+    # Return a consistent JSON shape
+    return {"dates": sorted(list(days))}
 
 
 # PUBLIC_INTERFACE
