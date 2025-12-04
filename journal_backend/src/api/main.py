@@ -512,13 +512,15 @@ async def create_journal_entry(
     try:
         # Prefer JSON mode when payload provided (Angular sends application/json when no image)
         if payload is not None:
+            # JournalEntryCreate already validates/strips title/content; enforce again defensively
             in_title = (payload.title or "").strip()
             if not in_title:
-                # Match FastAPI validation error shape
+                # Mirror FastAPI validation shape for body field
                 raise HTTPException(
                     status_code=422,
-                    detail=[{"loc": ["body", "title"], "msg": "Field required", "type": "value_error"}],
+                    detail=[{"loc": ["body", "title"], "msg": "Field required", "type": "value_error.missing"}],
                 )
+            # content is optional and defaults to empty string
             in_content = (payload.content or "").strip()
         else:
             # Multipart mode (Angular sends multipart/form-data when image selected)
@@ -528,6 +530,7 @@ async def create_journal_entry(
                     detail=[{"loc": ["form", "title"], "msg": "Field required", "type": "value_error.missing"}],
                 )
             in_title = str(title).strip()
+            # content optional; default to empty string when omitted
             in_content = (content or "").strip()
 
         image_url: Optional[str] = None
@@ -553,12 +556,30 @@ async def create_journal_entry(
                 created_at=entry.created_at,
                 updated_at=entry.updated_at,
             )
-    except HTTPException:
-        # Let structured 422/4xx bubble up
-        raise
+    except HTTPException as http_exc:
+        # Add explicit context for validation mismatches to ease debugging in logs
+        ct = "unknown"
+        try:
+            # Avoid importing Request here; keep context minimal
+            ct = "json" if payload is not None else "multipart"
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=http_exc.status_code,
+            detail={
+                "error": "Validation failed creating journal entry",
+                "context": {
+                    "mode": ct,
+                    "detail": getattr(http_exc, "detail", None),
+                },
+            },
+        )
     except Exception as exc:
         # Wrap unexpected errors
-        raise _structured_500("Failed to create journal entry", {"exception": str(exc)})
+        raise _structured_500(
+            "Failed to create journal entry",
+            {"exception": str(exc)},
+        )
 
 
 # PUBLIC_INTERFACE
@@ -618,7 +639,7 @@ async def update_journal_entry(
                     if not t:
                         raise HTTPException(
                             status_code=422,
-                            detail=[{"loc": ["form", "title"], "msg": "Title must not be empty", "type": "value_error"}],
+                            detail=[{"loc": ["form", "title"], "msg": "Title must not be empty", "type": "value_error.missing"}],
                         )
                     if t != entry.title:
                         entry.title = t
