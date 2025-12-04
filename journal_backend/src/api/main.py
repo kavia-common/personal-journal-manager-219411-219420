@@ -3,7 +3,7 @@ import os
 import secrets
 from typing import List, Optional, Set, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Path, UploadFile, File, Form, Query, Body
+from fastapi import FastAPI, HTTPException, Path, UploadFile, File, Form, Query, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -114,6 +114,44 @@ async def verify_create_json():
     except Exception as exc:
         raise _structured_500("Verification failed (JSON create)", {"exception": str(exc)})
 
+# PUBLIC_INTERFACE
+@app.post(
+    "/api/journal-entries/_verify-update-json",
+    tags=["Journal Entries"],
+    summary="Internal: verify JSON update path",
+    description="Creates an entry then updates it via application/json to verify 200 response.",
+)
+async def verify_update_json():
+    """Simulate JSON PUT update."""
+    try:
+        from fastapi.testclient import TestClient
+        client = TestClient(app)
+        create = client.post("/api/journal-entries", json={"title": "To Update", "content": ""})
+        eid = create.json()["id"]
+        upd = client.put(f"/api/journal-entries/{eid}", json={"title": "Updated Title"})
+        return {"create_status": create.status_code, "update_status": upd.status_code, "updated": upd.json()}
+    except Exception as exc:
+        raise _structured_500("Verification failed (JSON update)", {"exception": str(exc)})
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/api/journal-entries/_verify-update-multipart",
+    tags=["Journal Entries"],
+    summary="Internal: verify multipart update path",
+    description="Creates an entry then updates it via multipart/form-data to verify 200 response.",
+)
+async def verify_update_multipart():
+    """Simulate multipart PUT update without a file."""
+    try:
+        from fastapi.testclient import TestClient
+        client = TestClient(app)
+        create = client.post("/api/journal-entries", json={"title": "To Update MP", "content": ""})
+        eid = create.json()["id"]
+        upd = client.put(f"/api/journal-entries/{eid}", data={"title": "MP Updated", "content": ""}, files={})
+        return {"create_status": create.status_code, "update_status": upd.status_code, "updated": upd.json()}
+    except Exception as exc:
+        raise _structured_500("Verification failed (multipart update)", {"exception": str(exc)})
+
 
 # PUBLIC_INTERFACE
 @app.post(
@@ -135,6 +173,32 @@ async def verify_create_multipart():
         return {"status_code": resp.status_code, "json": resp.json()}
     except Exception as exc:
         raise _structured_500("Verification failed (multipart create)", {"exception": str(exc)})
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/api/journal-entries/_inspect",
+    tags=["Journal Entries"],
+    summary="Internal: inspect incoming request",
+    description="Returns detected Content-Type and parsed form/body fields to debug payload shapes from the frontend.",
+)
+async def inspect_request(
+    request: Request,
+    payload: Optional[JournalEntryCreate] = Body(None),
+    title: Optional[str] = Form(None),
+    content: Optional[str] = Form(None),
+    image_remove: Optional[bool] = Form(None),
+):
+    """Return basic info about the request for debugging client payload issues."""
+    try:
+        ct = request.headers.get("content-type", "")
+        return {
+            "content_type": ct,
+            "has_json_payload": payload is not None,
+            "json_payload": payload.model_dump() if payload is not None else None,
+            "form": {"title": title, "content": content, "image_remove": image_remove},
+        }
+    except Exception as exc:
+        raise _structured_500("Inspection failed", {"exception": str(exc)})
 
 
 # Helpers
@@ -410,7 +474,7 @@ async def create_journal_entry(
     content: Optional[str] = Form(
         None, description="Content/body for the entry (0..10000 chars); may be empty"
     ),
-    image: Optional[UploadFile] = File(None, description="Optional image file",),
+    image: Optional[UploadFile] = File(None, description="Optional image file"),
     image_remove: Optional[bool] = Form(
         False,
         description="Set true to explicitly remove an already-attached image (not typical on create).",
@@ -425,44 +489,56 @@ async def create_journal_entry(
     """
     now = datetime.utcnow()
 
-    # Determine input mode: prefer JSON when provided and no file/image fields are present
-    # In FastAPI, both sets of params are visible; decision is based on payload existence.
-    if payload is not None:
-        in_title = payload.title.strip()
-        in_content = (payload.content or "").strip()
-    else:
-        # Multipart requires title at minimum; content can be empty per UI behavior.
-        if title is None:
-            raise HTTPException(
-                status_code=422,
-                detail={"error": "Validation error", "detail": [{"loc": ["form", "title"], "msg": "Field required", "type": "value_error.missing"}]},
-            )
-        in_title = title.strip()
-        in_content = (content or "").strip()
+    try:
+        # Prefer JSON mode when payload provided (Angular sends application/json when no image)
+        if payload is not None:
+            in_title = (payload.title or "").strip()
+            if not in_title:
+                # Match FastAPI validation error shape
+                raise HTTPException(
+                    status_code=422,
+                    detail=[{"loc": ["body", "title"], "msg": "Field required", "type": "value_error"}],
+                )
+            in_content = (payload.content or "").strip()
+        else:
+            # Multipart mode (Angular sends multipart/form-data when image selected)
+            if title is None or not str(title).strip():
+                raise HTTPException(
+                    status_code=422,
+                    detail=[{"loc": ["form", "title"], "msg": "Field required", "type": "value_error.missing"}],
+                )
+            in_title = str(title).strip()
+            in_content = (content or "").strip()
 
-    image_url: Optional[str] = None
-    # image_remove on create is ignored unless provided true with existing image (no existing on create)
-    if image is not None:
-        image_url = _save_upload(image)
+        image_url: Optional[str] = None
+        # image_remove on create is typically ignored; if a file present, save it
+        if image is not None:
+            image_url = _save_upload(image)
 
-    entry = JournalEntry(
-        title=in_title,
-        content=in_content,
-        image_url=image_url,
-        created_at=now,
-        updated_at=now,
-    )
-    with get_session() as session:
-        session.add(entry)
-        session.flush()  # to populate autoincremented id
-        return JournalEntryRead(
-            id=entry.id,
-            title=entry.title,
-            content=entry.content,
-            image_url=entry.image_url,
-            created_at=entry.created_at,
-            updated_at=entry.updated_at,
+        entry = JournalEntry(
+            title=in_title,
+            content=in_content,
+            image_url=image_url,
+            created_at=now,
+            updated_at=now,
         )
+        with get_session() as session:
+            session.add(entry)
+            session.flush()  # to populate autoincremented id
+            return JournalEntryRead(
+                id=entry.id,
+                title=entry.title,
+                content=entry.content,
+                image_url=entry.image_url,
+                created_at=entry.created_at,
+                updated_at=entry.updated_at,
+            )
+    except HTTPException:
+        # Let structured 422/4xx bubble up
+        raise
+    except Exception as exc:
+        # Wrap unexpected errors
+        raise _structured_500("Failed to create journal entry", {"exception": str(exc)})
 
 
 # PUBLIC_INTERFACE
@@ -493,84 +569,82 @@ async def update_journal_entry(
     image_remove: Optional[bool] = Form(False, description="Set true to remove existing image"),
 ):
     """Update existing journal entry with optional image replacement/removal. Accepts JSON or multipart."""
-    with get_session() as session:
-        entry = session.get(JournalEntry, entry_id)
-        if entry is None:
-            raise HTTPException(status_code=404, detail="Journal entry not found")
+    try:
+        with get_session() as session:
+            entry = session.get(JournalEntry, entry_id)
+            if entry is None:
+                raise HTTPException(status_code=404, detail="Journal entry not found")
 
-        updated = False
+            updated = False
 
-        # Determine mode: prefer JSON when provided and no file in request
-        json_mode = payload is not None and image is None
+            # Prefer JSON mode when JSON payload provided and no file uploaded
+            json_mode = payload is not None and image is None
 
-        if json_mode:
-            # JSON update
-            if payload.title is not None:
-                t = payload.title.strip()
-                if not t:
-                    raise HTTPException(
-                        status_code=422,
-                        detail={"error": "Validation error", "detail": [{"loc": ["body", "title"], "msg": "Title must not be empty", "type": "value_error"}]},
-                    )
-                if t != entry.title:
-                    entry.title = t
+            if json_mode:
+                if payload.title is not None:
+                    t = payload.title.strip()
+                    if not t:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=[{"loc": ["body", "title"], "msg": "Title must not be empty", "type": "value_error"}],
+                        )
+                    if t != entry.title:
+                        entry.title = t
+                        updated = True
+                if payload.content is not None:
+                    c = payload.content.strip()
+                    if c != entry.content:
+                        entry.content = c
+                        updated = True
+                # No image ops in JSON mode
+            else:
+                # Multipart mode
+                if title is not None:
+                    t = title.strip()
+                    if not t:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=[{"loc": ["form", "title"], "msg": "Title must not be empty", "type": "value_error"}],
+                        )
+                    if t != entry.title:
+                        entry.title = t
+                        updated = True
+
+                if content is not None:
+                    c = content.strip()
+                    if c != entry.content:
+                        entry.content = c
+                        updated = True
+
+                if image_remove:
+                    if entry.image_url:
+                        _delete_existing_file(entry.image_url)
+                        entry.image_url = None
+                        updated = True
+
+                if image is not None:
+                    if entry.image_url:
+                        _delete_existing_file(entry.image_url)
+                    entry.image_url = _save_upload(image)
                     updated = True
-            if payload.content is not None:
-                c = payload.content.strip()
-                # Allow empty content to clear body
-                if c != entry.content:
-                    entry.content = c
-                    updated = True
-            # No image handling in JSON mode (frontend should use multipart for image ops)
-        else:
-            # Multipart update
-            if title is not None:
-                t = title.strip()
-                if not t:
-                    raise HTTPException(
-                        status_code=422,
-                        detail={"error": "Validation error", "detail": [{"loc": ["form", "title"], "msg": "Title must not be empty", "type": "value_error"}]},
-                    )
-                if t != entry.title:
-                    entry.title = t
-                    updated = True
 
-            if content is not None:
-                c = content.strip()
-                # Allow empty content to clear body
-                if c != entry.content:
-                    entry.content = c
-                    updated = True
+            if updated:
+                entry.updated_at = datetime.utcnow()
+                session.add(entry)
+                session.flush()
 
-            # Handle image update/removal
-            if image_remove:
-                if entry.image_url:
-                    # remove file from disk
-                    _delete_existing_file(entry.image_url)
-                    entry.image_url = None
-                    updated = True
-
-            if image is not None:
-                # replace existing file if any
-                if entry.image_url:
-                    _delete_existing_file(entry.image_url)
-                new_url = _save_upload(image)
-                entry.image_url = new_url
-                updated = True
-
-        if updated:
-            entry.updated_at = datetime.utcnow()
-            session.add(entry)
-            session.flush()
-
-        return JournalEntryRead(
-            id=entry.id,
-            title=entry.title,
-            content=entry.content,
-            image_url=entry.image_url,
-            created_at=entry.created_at,
-            updated_at=entry.updated_at,
-        )
+            return JournalEntryRead(
+                id=entry.id,
+                title=entry.title,
+                content=entry.content,
+                image_url=entry.image_url,
+                created_at=entry.created_at,
+                updated_at=entry.updated_at,
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _structured_500("Failed to update journal entry", {"exception": str(exc), "entry_id": entry_id})
 
 
 # PUBLIC_INTERFACE
