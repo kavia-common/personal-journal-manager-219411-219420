@@ -33,9 +33,14 @@ app = FastAPI(
     openapi_tags=openapi_tags,
 )
 
-# CORS - allow Angular frontend based on environment with safe defaults
-frontend_origin = os.environ.get("NG_APP_FRONTEND_URL", "http://localhost:3000")
-allow_origins = [frontend_origin] if isinstance(frontend_origin, str) else ["http://localhost:3000"]
+# CORS - allow Angular frontend based on environment with safe defaults.
+# Prefer ALLOWED_ORIGINS (comma-separated) else fall back to NG_APP_FRONTEND_URL, else permissive "*"
+raw_origins = os.environ.get("ALLOWED_ORIGINS")
+if raw_origins:
+    allow_origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
+else:
+    frontend_origin = os.environ.get("NG_APP_FRONTEND_URL")
+    allow_origins = [frontend_origin] if frontend_origin else ["*"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -116,30 +121,34 @@ def list_journal_entries(
     if start_date and end_date and end_date < start_date:
         raise HTTPException(status_code=400, detail="end_date must be on or after start_date")
 
-    with get_session() as session:
-        stmt = select(JournalEntry)
+    try:
+        with get_session() as session:
+            stmt = select(JournalEntry)
 
-        # Apply date filtering on created_at.date() via bounds on datetime
-        if start_date:
-            # start of the day: >= start_date 00:00:00
-            stmt = stmt.where(JournalEntry.created_at >= datetime.combine(start_date, datetime.min.time()))
-        if end_date:
-            # inclusive end-of-day: <= end_date 23:59:59.999999
-            stmt = stmt.where(JournalEntry.created_at <= datetime.combine(end_date, datetime.max.time()))
+            # Apply date filtering on created_at via inclusive bounds
+            if start_date:
+                stmt = stmt.where(JournalEntry.created_at >= datetime.combine(start_date, datetime.min.time()))
+            if end_date:
+                stmt = stmt.where(JournalEntry.created_at <= datetime.combine(end_date, datetime.max.time()))
 
-        stmt = stmt.order_by(JournalEntry.updated_at.desc())
-        entries = session.exec(stmt).all()
-        return [
-            JournalEntryRead(
-                id=e.id,
-                title=e.title,
-                content=e.content,
-                image_url=e.image_url,
-                created_at=e.created_at,
-                updated_at=e.updated_at,
-            )
-            for e in entries
-        ]
+            stmt = stmt.order_by(JournalEntry.updated_at.desc())
+            entries = session.exec(stmt).all() or []
+            return [
+                JournalEntryRead(
+                    id=e.id,
+                    title=e.title,
+                    content=e.content,
+                    image_url=e.image_url,
+                    created_at=e.created_at,
+                    updated_at=e.updated_at,
+                )
+                for e in entries
+            ]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Return a structured 500 with error detail to aid debugging in preview
+        raise HTTPException(status_code=500, detail=f"Failed to list journal entries: {exc}")
 
 
 class DatesWithEntriesResponse(JSONResponse):
@@ -164,20 +173,22 @@ def get_dates_with_entries(
     if end_date < start_date:
         raise HTTPException(status_code=400, detail="end_date must be on or after start_date")
 
-    with get_session() as session:
-        stmt = select(JournalEntry).where(
-            JournalEntry.created_at >= datetime.combine(start_date, datetime.min.time()),
-            JournalEntry.created_at <= datetime.combine(end_date, datetime.max.time()),
-        )
-        entries = session.exec(stmt).all()
+    try:
+        with get_session() as session:
+            stmt = select(JournalEntry).where(
+                JournalEntry.created_at >= datetime.combine(start_date, datetime.min.time()),
+                JournalEntry.created_at <= datetime.combine(end_date, datetime.max.time()),
+            )
+            entries = session.exec(stmt).all() or []
 
-        # Collect unique dates (as ISO YYYY-MM-DD strings) to be JSON-friendly
-        days: Set[str] = set()
-        for e in entries:
-            days.add(e.created_at.date().isoformat())
-
-    # Return a consistent JSON shape
-    return {"dates": sorted(list(days))}
+            days: Set[str] = set()
+            for e in entries:
+                days.add(e.created_at.date().isoformat())
+        return {"dates": sorted(list(days))}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch dates with entries: {exc}")
 
 
 # PUBLIC_INTERFACE
