@@ -5,7 +5,7 @@ from typing import List, Optional, Set, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Path, UploadFile, File, Form, Query, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 
 from src.api.db import init_db, get_session
@@ -16,6 +16,19 @@ from src.api.models import (
     JournalEntryUpdate,
 )
 from sqlmodel import select
+
+# Define simple Pydantic models for internal endpoints to ensure OpenAPI serialization
+from pydantic import BaseModel, Field
+
+
+# PUBLIC_INTERFACE
+class VerifyResult(BaseModel):
+    """Result model for verification endpoints."""
+    status_code: Optional[int] = Field(None, description="HTTP status code from the internal request")
+    create_status: Optional[int] = Field(None, description="HTTP status code from create operation")
+    update_status: Optional[int] = Field(None, description="HTTP status code from update operation")
+    json: Optional[Dict[str, Any]] = Field(None, description="JSON payload returned")
+    updated: Optional[Dict[str, Any]] = Field(None, description="Updated entry JSON payload")
 
 openapi_tags = [
     {
@@ -71,6 +84,7 @@ def on_startup() -> None:
 # PUBLIC_INTERFACE
 @app.post(
     "/api/journal-entries/_verify-post",
+    response_model=JournalEntryRead,
     tags=["Journal Entries"],
     summary="Internal verification: sample POST",
     description="Creates a sample entry using application/json to verify 201 response path without image. Not for production use.",
@@ -100,6 +114,7 @@ def verify_post_sample():
 # PUBLIC_INTERFACE
 @app.post(
     "/api/journal-entries/_verify-create-json",
+    response_model=VerifyResult,
     tags=["Journal Entries"],
     summary="Internal: verify JSON create path",
     description="Sends an application/json request to POST /api/journal-entries and returns the result.",
@@ -117,6 +132,7 @@ async def verify_create_json():
 # PUBLIC_INTERFACE
 @app.post(
     "/api/journal-entries/_verify-update-json",
+    response_model=VerifyResult,
     tags=["Journal Entries"],
     summary="Internal: verify JSON update path",
     description="Creates an entry then updates it via application/json to verify 200 response.",
@@ -136,6 +152,7 @@ async def verify_update_json():
 # PUBLIC_INTERFACE
 @app.post(
     "/api/journal-entries/_verify-update-multipart",
+    response_model=VerifyResult,
     tags=["Journal Entries"],
     summary="Internal: verify multipart update path",
     description="Creates an entry then updates it via multipart/form-data to verify 200 response.",
@@ -156,6 +173,7 @@ async def verify_update_multipart():
 # PUBLIC_INTERFACE
 @app.post(
     "/api/journal-entries/_verify-create-multipart",
+    response_model=VerifyResult,
     tags=["Journal Entries"],
     summary="Internal: verify multipart create path",
     description="Sends a multipart/form-data request to POST /api/journal-entries (no file) and returns the result.",
@@ -175,8 +193,18 @@ async def verify_create_multipart():
         raise _structured_500("Verification failed (multipart create)", {"exception": str(exc)})
 
 # PUBLIC_INTERFACE
+# PUBLIC_INTERFACE
+class InspectResult(BaseModel):
+    """Response model for request inspection."""
+    content_type: str = Field(..., description="Content-Type header of the request")
+    has_json_payload: bool = Field(..., description="Whether a JSON payload was parsed")
+    json_payload: Optional[Dict[str, Any]] = Field(None, description="Parsed JSON payload if present")
+    form: Dict[str, Optional[Any]] = Field(..., description="Form fields when multipart/form-data is used")
+
+
 @app.post(
     "/api/journal-entries/_inspect",
+    response_model=InspectResult,
     tags=["Journal Entries"],
     summary="Internal: inspect incoming request",
     description="Returns detected Content-Type and parsed form/body fields to debug payload shapes from the frontend.",
@@ -365,8 +393,7 @@ def list_journal_entries(
         )
 
 
-class DatesWithEntriesResponse(JSONResponse):
-    pass
+
 
 
 # PUBLIC_INTERFACE
@@ -459,13 +486,6 @@ async def create_journal_entry(
     payload: Optional[JournalEntryCreate] = Body(
         None,
         description="JSON body with title and content (used when no image is provided)",
-        examples={
-            "json": {
-                "summary": "JSON create without image",
-                "description": "Create a journal entry using JSON payload",
-                "value": {"title": "My day", "content": "Went hiking today."},
-            }
-        },
     ),
     # Multipart path (when Content-Type is multipart/form-data)
     title: Optional[str] = Form(
@@ -555,12 +575,6 @@ async def update_journal_entry(
     payload: Optional[JournalEntryUpdate] = Body(
         None,
         description="JSON body with fields to update when not uploading an image",
-        examples={
-            "json-partial": {
-                "summary": "Partial JSON update",
-                "value": {"title": "Updated title"},
-            }
-        },
     ),
     # Multipart path
     title: Optional[str] = Form(None, description="Updated title (1..200 chars)"),
