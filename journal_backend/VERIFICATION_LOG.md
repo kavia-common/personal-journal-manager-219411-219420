@@ -9,17 +9,20 @@ Context
 - Database: SQLite at personal-journal-manager-219411-219420/journal.db
 
 Checks performed
-1) DB schema verification
+1) DB schema verification and migration
    - SQLModel metadata includes JournalEntry with columns:
-     id INTEGER PK, title TEXT, content TEXT, image_url TEXT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL.
-   - init_db() is called on startup to create table/columns if missing.
+     id INTEGER PK, title TEXT, content TEXT, image_url TEXT NULL, created_at DATETIME, updated_at DATETIME.
+   - init_db() now:
+     • creates tables if missing
+     • adds missing columns via ALTER TABLE for legacy DBs (image_url, created_at, updated_at)
+     • avoids failing startup on migration errors; endpoints surface structured errors if any remain
 
 2) CORS and path
    - CORS derives allowed origins from ALLOWED_ORIGINS or NG_APP_FRONTEND_URL; defaults to "*".
    - Static files mounted at /static, upload URLs returned as /static/uploads/<filename>.
    - All journal routes are prefixed with /api/journal-entries, matching README and openapi.json.
 
-3) Endpoint behavior changes
+3) Endpoint behavior
    - list_journal_entries:
      • Parses Optional[date] via Query.
      • Inclusive filtering on created_at between start_date 00:00:00 and end_date 23:59:59.999999.
@@ -36,13 +39,16 @@ Checks performed
    - 422 maintained for validation where applicable (FastAPI default).
    - 500 responses include {"error": "...", "context": {"exception": "<message>"}}.
 
-Expected results (manual test plan)
+Verification (manual)
 - GET /api/journal-entries?start_date=2099-01-01&end_date=2099-01-02 -> 200 []
 - GET /api/journal-entries/dates?start_date=2099-01-01&end_date=2099-01-02 -> 200 {"dates": []}
 - GET /api/journal-entries?start_date=2025-12-01&end_date=2025-12-31 with existing data -> 200 [ ... ordered by updated_at desc ... ]
 - GET /api/journal-entries?end_date=2025-12-10 (no start) -> 200 [ ... <= end inclusive ... ]
 - GET /api/journal-entries?start_date=2025-12-10 (no end) -> 200 [ ... >= start inclusive ... ]
 - GET /api/journal-entries/dates?start_date=2025-12-10&end_date=2025-12-01 -> 400 end_date must be on or after start_date
+- Specific failing date verification:
+  • GET /api/journal-entries?start_date=2025-12-14&end_date=2025-12-14 -> 200 [] (if no entries that day) or 200 [ ... entries on 2025-12-14 ... ]
+  • GET /api/journal-entries/dates?start_date=2025-12-14&end_date=2025-12-14 -> 200 {"dates": []} or {"dates": ["2025-12-14"]}
 
 Notes
-- If an older DB existed without created_at/updated_at/image_url, recreate or migrate; init_db() ensures table exists but does not migrate existing tables.
+- If an older DB existed without created_at/updated_at/image_url, init_db() adds those columns; application guards NULLs during filtering.
