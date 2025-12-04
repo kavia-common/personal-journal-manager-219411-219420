@@ -193,7 +193,6 @@ async def verify_create_multipart():
         raise _structured_500("Verification failed (multipart create)", {"exception": str(exc)})
 
 # PUBLIC_INTERFACE
-# PUBLIC_INTERFACE
 class InspectResult(BaseModel):
     """Response model for request inspection."""
     content_type: str = Field(..., description="Content-Type header of the request")
