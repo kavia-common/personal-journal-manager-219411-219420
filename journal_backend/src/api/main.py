@@ -120,16 +120,18 @@ def _structured_500(message: str, context: Optional[Dict[str, Any]] = None) -> H
     response_model=List[JournalEntryRead],
     tags=["Journal Entries"],
     summary="List journal entries",
-    description="Returns a list of journal entries ordered by most recently updated. Supports optional date-range filtering using start_date and end_date (YYYY-MM-DD).",
+    description="Returns a list of journal entries ordered by most recently updated. Supports optional case-insensitive substring search by title, and optional date-range filtering using start_date and end_date (YYYY-MM-DD).",
 )
 def list_journal_entries(
     start_date: Optional[date] = Query(None, description="Start date (YYYY-MM-DD), inclusive"),
     end_date: Optional[date] = Query(None, description="End date (YYYY-MM-DD), inclusive"),
+    title: Optional[str] = Query(None, description="Case-insensitive substring to match in the title"),
 ):
     """
-    List journal entries with optional date-range filtering.
+    List journal entries with optional title search and date-range filtering.
 
     Parameters:
+    - title: optional case-insensitive substring to search in title
     - start_date: optional start date YYYY-MM-DD (inclusive)
     - end_date: optional end date YYYY-MM-DD (inclusive)
 
@@ -159,6 +161,13 @@ def list_journal_entries(
             if end_dt is not None:
                 stmt = stmt.where(JournalEntry.created_at != None)  # noqa: E711
                 stmt = stmt.where(JournalEntry.created_at <= end_dt)
+
+            # Title search (case-insensitive substring on title)
+            if title:
+                t = title.strip()
+                if t:
+                    # Use SQLModel/SQLAlchemy ilike for case-insensitive match
+                    stmt = stmt.where(JournalEntry.title.ilike(f"%{t}%"))
 
             # Always order by latest updated first
             stmt = stmt.order_by(JournalEntry.updated_at.desc())
@@ -193,6 +202,7 @@ def list_journal_entries(
             "Failed to list journal entries",
             {
                 "exception": str(exc),
+                "title": title,
                 "start_date": start_date.isoformat() if start_date else None,
                 "end_date": end_date.isoformat() if end_date else None,
             },
